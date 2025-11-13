@@ -1,0 +1,204 @@
+import discord
+from discord.ext import commands
+import asyncio
+import sqlite3
+from datetime import datetime, timedelta
+import json
+
+# Bot setup
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
+intents.reactions = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Auction class to manage each auction
+class Auction:
+    def __init__(self, item_name, start_price, duration_minutes, creator_id, channel_id):
+        self.item_name = item_name
+        self.start_price = start_price
+        self.current_bid = start_price
+        self.duration = duration_minutes
+        self.creator_id = creator_id
+        self.channel_id = channel_id
+        self.highest_bidder = None
+        self.bid_history = []
+        self.start_time = datetime.now()
+        self.end_time = self.start_time + timedelta(minutes=duration_minutes)
+        self.is_active = True
+        self.message_id = None
+    
+    def place_bid(self, bidder_id, bid_amount):
+        if bid_amount > self.current_bid:
+            self.bid_history.append({
+                'bidder': bidder_id,
+                'amount': bid_amount,
+                'time': datetime.now()
+            })
+            self.current_bid = bid_amount
+            self.highest_bidder = bidder_id
+            return True
+        return False
+
+# Auction manager to handle multiple auctions
+class AuctionManager:
+    def __init__(self):
+        self.active_auctions = {}
+        self.setup_database()
+    
+    def setup_database(self):
+        conn = sqlite3.connect('auctions.db')
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS auctions
+                    (id INTEGER PRIMARY KEY, item_name TEXT, winner_id INTEGER, final_bid REAL, end_time TEXT)''')
+        conn.commit()
+        conn.close()
+    
+    def create_auction(self, item_name, start_price, duration, creator_id, channel_id):
+        auction_id = len(self.active_auctions) + 1
+        auction = Auction(item_name, start_price, duration, creator_id, channel_id)
+        self.active_auctions[auction_id] = auction
+        return auction_id, auction
+    
+    def get_auction(self, auction_id):
+        return self.active_auctions.get(auction_id)
+    
+    def end_auction(self, auction_id):
+        if auction_id in self.active_auctions:
+            auction = self.active_auctions[auction_id]
+            auction.is_active = False
+            # Save to database
+            conn = sqlite3.connect('auctions.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO auctions (item_name, winner_id, final_bid, end_time) VALUES (?, ?, ?, ?)",
+                     (auction.item_name, auction.highest_bidder, auction.current_bid, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            del self.active_auctions[auction_id]
+            return auction
+        return None
+
+# Initialize manager
+auction_manager = AuctionManager()
+
+# Bot events
+@bot.event
+async def on_ready():
+    print(f'🚀 Auction Bot is online! Connected as {bot.user.name}')
+    print(f'💎 Use !auction_help to see available commands')
+
+# Auction commands
+@bot.command(name='auction_start')
+async def start_auction(ctx, item_name: str, start_price: float, duration_minutes: int = 5):
+    """Start a new auction"""
+    auction_id, auction = auction_manager.create_auction(
+        item_name, start_price, duration_minutes, ctx.author.id, ctx.channel.id
+    )
+    
+    embed = discord.Embed(
+        title=f"🎪 **AUCTION STARTED!**",
+        description=f"**Item:** {item_name}\n**Starting Bid:** ${start_price:.2f}",
+        color=0x00ff00
+    )
+    embed.add_field(name="⏰ Duration", value=f"{duration_minutes} minutes", inline=True)
+    embed.add_field(name="🔢 Auction ID", value=f"#{auction_id}", inline=True)
+    embed.add_field(name="💳 Current Bid", value=f"${auction.current_bid:.2f}", inline=True)
+    embed.set_footer(text=f"Auction created by {ctx.author.display_name}")
+    
+    message = await ctx.send(embed=embed)
+    auction.message_id = message.id
+    
+    # Start countdown
+    asyncio.create_task(auction_countdown(ctx, auction_id, auction))
+
+@bot.command(name='bid')
+async def place_bid(ctx, auction_id: int, bid_amount: float):
+    """Place a bid on an active auction"""
+    auction = auction_manager.get_auction(auction_id)
+    
+    if not auction or not auction.is_active:
+        await ctx.send("❌ Auction not found or has ended!")
+        return
+    
+    if bid_amount <= auction.current_bid:
+        await ctx.send(f"❌ Bid must be higher than current bid (${auction.current_bid:.2f})!")
+        return
+    
+    if auction.place_bid(ctx.author.id, bid_amount):
+        embed = discord.Embed(
+            title="💰 **NEW HIGH BID!**",
+            description=f"**{ctx.author.display_name}** bid **${bid_amount:.2f}** on **{auction.item_name}**!",
+            color=0xffd700
+        )
+        embed.add_field(name="⏰ Time Left", value=f"{(auction.end_time - datetime.now()).seconds//60} minutes", inline=True)
+        embed.add_field(name="👑 High Bidder", value=ctx.author.display_name, inline=True)
+        
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("❌ Failed to place bid!")
+
+@bot.command(name='auction_info')
+async def auction_info(ctx, auction_id: int):
+    """Get information about an auction"""
+    auction = auction_manager.get_auction(auction_id)
+    
+    if auction:
+        embed = discord.Embed(title=f"📊 Auction #{auction_id} Info", color=0x0099ff)
+        embed.add_field(name="🛍️ Item", value=auction.item_name, inline=True)
+        embed.add_field(name="💵 Current Bid", value=f"${auction.current_bid:.2f}", inline=True)
+        embed.add_field(name="⏰ Time Left", value=f"{(auction.end_time - datetime.now()).seconds//60}m", inline=True)
+        
+        if auction.highest_bidder:
+            bidder = await bot.fetch_user(auction.highest_bidder)
+            embed.add_field(name="👑 High Bidder", value=bidder.display_name, inline=True)
+        
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("❌ Auction not found!")
+
+@bot.command(name='auction_help')
+async def auction_help(ctx):
+    """Show all auction commands"""
+    embed = discord.Embed(title="🎪 Auction Bot Help", color=0x7289da)
+    
+    commands_list = [
+        ("!auction_start <item> <price> [minutes]", "Start a new auction (default 5 min)"),
+        ("!bid <auction_id> <amount>", "Place a bid on an auction"),
+        ("!auction_info <auction_id>", "Check auction status"),
+        ("!auction_help", "Show this help message")
+    ]
+    
+    for cmd, desc in commands_list:
+        embed.add_field(name=cmd, value=desc, inline=False)
+    
+    await ctx.send(embed=embed)
+
+# Countdown task
+async def auction_countdown(ctx, auction_id, auction):
+    """Handle auction countdown and ending"""
+    while datetime.now() < auction.end_time and auction.is_active:
+        await asyncio.sleep(30)  # Update every 30 seconds
+    
+    if auction.is_active:
+        ended_auction = auction_manager.end_auction(auction_id)
+        if ended_auction and ended_auction.highest_bidder:
+            winner = await bot.fetch_user(ended_auction.highest_bidder)
+            
+            embed = discord.Embed(
+                title="🎉 **AUCTION ENDED!**",
+                description=f"**{ended_auction.item_name}** sold for **${ended_auction.current_bid:.2f}**!",
+                color=0xff0000
+            )
+            embed.add_field(name="🏆 Winner", value=winner.display_name, inline=True)
+            embed.add_field(name="💵 Final Price", value=f"${ended_auction.current_bid:.2f}", inline=True)
+            embed.set_footer(text="Congratulations! Contact the seller to arrange delivery.")
+            
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send(f"🛑 Auction for **{auction.item_name}** ended with no bids!")
+
+# Run the bot
+if __name__ == "__main__":
+    # Replace with your bot token
+    bot.run('YOUR_BOT_TOKEN_HERE')
